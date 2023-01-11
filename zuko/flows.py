@@ -13,6 +13,8 @@ __all__ = [
     'NAF',
     'FreeFormJacobianTransform',
     'CNF',
+    'SimpleAffineTransform',
+    'IntervalToRealTransform'
 ]
 
 import abc
@@ -189,6 +191,7 @@ class MaskedAutoregressiveTransform(TransformModule):
         passes: int = None,
         order: LongTensor = None,
         univariate: Callable[..., Transform] = MonotonicAffineTransform,
+        univariate_kwargs: Dict[str, Any] = {},
         shapes: List[Size] = [(), ()],
         **kwargs,
     ):
@@ -196,6 +199,7 @@ class MaskedAutoregressiveTransform(TransformModule):
 
         # Univariate transformation
         self.univariate = univariate
+        self.univariate_kwargs = univariate_kwargs
         self.shapes = list(map(Size, shapes))
         self.sizes = [s.numel() for s in self.shapes]
 
@@ -244,7 +248,7 @@ class MaskedAutoregressiveTransform(TransformModule):
         phi = (p.unflatten(-1, s + (1,)) for p, s in zip(phi, self.shapes))
         phi = (p.squeeze(-1) for p in phi)
 
-        return self.univariate(*phi)
+        return self.univariate(*phi, **self.univariate_kwargs)
 
     def forward(self, y: Tensor = None) -> Transform:
         return AutoregressiveTransform(partial(self.meta, y), self.passes)
@@ -255,7 +259,7 @@ class MAF(FlowModule):
 
     References:
         | Masked Autoregressive Flow for Density Estimation (Papamakarios et al., 2017)
-        | https://arxiv.org/abs/1705.07057
+ >        | https://arxiv.org/abs/1705.07057
 
     Arguments:
         features: The number of features.
@@ -321,6 +325,8 @@ class MAF(FlowModule):
         context: int = 0,
         transforms: int = 3,
         randperm: bool = False,
+        base: Distribution = DiagNormal,
+        base_args: List[Size] = [],
         **kwargs,
     ):
         orders = [
@@ -338,10 +344,15 @@ class MAF(FlowModule):
             for i in range(transforms)
         ]
 
+        if len(base_args)==0 and base is DiagNormal:
+            base_args = [
+                torch.zeros(features),
+                torch.ones(features)
+            ]
+
         base = Unconditional(
-            DiagNormal,
-            torch.zeros(features),
-            torch.ones(features),
+            base,
+            *base_args,
             buffer=True,
         )
 
@@ -753,3 +764,47 @@ class CNF(FlowModule):
         )
 
         super().__init__(transforms, base)
+
+
+
+class SimpleAffineTransform(TransformModule):
+    
+    def __init__(self,
+                 xmin: Tensor,
+                 xmax: Tensor,
+                 ymin: Tensor,
+                 ymax: Tensor):
+        super().__init__()
+        self.xmin = xmin
+        self.xmax = xmax
+        self.ymin = ymin
+        self.ymax = ymax
+        self.scale = (ymax-ymin)/(xmax-xmin)
+        self.loc = (ymax - self.scale*xmax)
+        
+    def extra_repr(self) -> str:
+        return f'[{self.xmin}, {self.xmax}] -> [{self.ymin}, {self.ymax}]'
+        
+    def forward(self, y: Tensor = None) -> Transform:
+        return AffineTransform(scale=self.scale, loc=self.loc)
+
+
+class IntervalToRealTransform(TransformModule):
+    """
+    Transform from Interval to R through an Affine and InverseSoftclip Transform
+    """
+    def __init__(self, xmin: Tensor, xmax: Tensor):
+        super().__init__()
+        self.xmin = xmin
+        self.xmax = xmax
+        self.scale = (2/(self.xmax -self.xmin))
+        self.shift =  1 -self.scale*self.xmax
+        
+    def extra_repr(self) -> str:
+        return f'[{self.xmin}, {self.xmax}] -> [-1,1] -> softclip -> R'
+        
+    def forward(self, y: Tensor = None) -> Transform:
+        return ComposedTransform(
+            AffineTransform(scale=self.scale, loc=self.shift),
+            InverseSoftclipTransform(bound=1))
+
