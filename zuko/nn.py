@@ -168,6 +168,7 @@ class MaskedMLP(nn.Sequential):
         adjacency: BoolTensor,
         hidden_features: List[int] = [64, 64],
         activation: Callable[[], nn.Module] = None,
+        **kwargs
     ):
         out_features, in_features = adjacency.shape
 

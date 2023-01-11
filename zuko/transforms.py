@@ -232,6 +232,71 @@ class SoftclipTransform(Transform):
         return -2 * torch.log1p(abs(x / self.bound))
 
 
+class InverseSoftclipTransform(Transform):
+    r"""Creates a transform that maps :math:`\mathbb{R}` to the inverval :math:`[-B, B]`.
+
+    .. math:: f(x) = \frac{x}{1 + \left| \frac{x}{B} \right|}
+
+    Arguments:
+        bound: The codomain bound :math:`B`.
+    """
+
+    domain = constraints.real
+    codomain = constraints.real
+    bijective = True
+    sign = +1
+
+    def __init__(self, bound: float = 5.0, **kwargs):
+        super().__init__(**kwargs)
+
+        self.bound = bound
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(bound={self.bound})'
+
+    def _call(self, x: Tensor) -> Tensor:
+        return x / (1 - abs(x / self.bound))
+
+    def _inverse(self, y: Tensor) -> Tensor:
+        return y / (1 + abs(y / self.bound))
+
+    def log_abs_det_jacobian(self, x: Tensor, y: Tensor) -> Tensor:
+        return -2 * torch.log1p(abs(x / self.bound))
+
+
+class InverseTanhTransform(Transform):
+    r"""Creates a transform that maps :math:`[-1,1]` to the inverval :math:`R`.
+
+    .. math:: f(x) = arctanh(x)
+
+    Derivative:
+
+    .. math:: f'(x) = \frac{1}{1 - x^2}
+
+    """
+
+    domain =  constraints.interval(-1, 1)
+    codomain = constraints.real
+    bijective = True
+    sign = +1
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}()'
+
+    def _call(self, x: Tensor) -> Tensor:
+        return x.atanh()
+
+    def _inverse(self, y: Tensor) -> Tensor:
+        return y.tanh()
+
+    def log_abs_det_jacobian(self, x: Tensor, y: Tensor) -> Tensor:
+        return 1 / (1 - x**2)
+
+
+
 class MonotonicAffineTransform(Transform):
     r"""Creates a transformation :math:`f(x) = \alpha x + \beta`.
 
