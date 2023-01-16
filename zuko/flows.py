@@ -779,8 +779,8 @@ class SimpleAffineTransform(TransformModule):
         self.xmax = xmax
         self.ymin = ymin
         self.ymax = ymax
-        self.scale = (ymax-ymin)/(xmax-xmin)
-        self.loc = (ymax - self.scale*xmax)
+        self.scale = nn.Parameter((ymax-ymin)/(xmax-xmin))
+        self.loc = nn.Parameter((ymax - self.scale*xmax))
         
     def extra_repr(self) -> str:
         return f'[{self.xmin}, {self.xmax}] -> [{self.ymin}, {self.ymax}]'
