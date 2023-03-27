@@ -6,14 +6,16 @@ __all__ = [
     'CosTransform',
     'SinTransform',
     'SoftclipTransform',
+    'CircularShiftTransform',
     'MonotonicAffineTransform',
     'MonotonicRQSTransform',
     'MonotonicTransform',
     'UnconstrainedMonotonicTransform',
     'SOSPolynomialTransform',
-    'FFJTransform',
+    'FreeFormJacobianTransform',
     'AutoregressiveTransform',
     'PermutationTransform',
+    'InverseSoftclipTransform',
 ]
 
 import math
@@ -37,7 +39,7 @@ def _call_and_ladj(self, x: Tensor) -> Tuple[Tensor, Tensor]:
     r"""Returns both the transformed value and the log absolute determinant of the
     transformation's Jacobian."""
 
-    y = self._call(x)
+    y = self.__call__(x)
     ladj = self.log_abs_det_jacobian(x, y)
 
     return y, ladj
@@ -201,7 +203,8 @@ class SinTransform(Transform):
 
 
 class SoftclipTransform(Transform):
-    r"""Creates a transform that maps :math:`\mathbb{R}` to the inverval :math:`[-B, B]`.
+    r"""Creates a transformation that maps :math:`\mathbb{R}` to the interval
+    :math:`[-B, B]`.
 
     .. math:: f(x) = \frac{x}{1 + \left| \frac{x}{B} \right|}
 
@@ -232,11 +235,44 @@ class SoftclipTransform(Transform):
         return -2 * torch.log1p(abs(x / self.bound))
 
 
+class CircularShiftTransform(Transform):
+    r"""Creates a transformation that circularly shifts the interval :math:`[-B, B]`.
+
+    .. math:: f(x) = (x \bmod 2B) - B
+
+    Note:
+        This transformation is only bijective over its domain :math:`[-B, B]` as
+        :math:`f(x) = f(x + 2kB)` for all :math:`k \in \mathbb{Z}`.
+
+    Arguments:
+        bound: The domain bound :math:`B`.
+    """
+
+    domain = constraints.real
+    codomain = constraints.real
+    bijective = True
+
+    def __init__(self, bound: float = 5.0, **kwargs):
+        super().__init__(**kwargs)
+
+        self.bound = bound
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(bound={self.bound})'
+
+    def _call(self, x: Tensor) -> Tensor:
+        return torch.remainder(x, 2 * self.bound) - self.bound
+
+    def _inverse(self, y: Tensor) -> Tensor:
+        return torch.remainder(y, 2 * self.bound) - self.bound
+
+    def log_abs_det_jacobian(self, x: Tensor, y: Tensor) -> Tensor:
+        return torch.zeros_like(x)
+
+
 class InverseSoftclipTransform(Transform):
     r"""Creates a transform that maps :math:`\mathbb{R}` to the inverval :math:`[-B, B]`.
-
     .. math:: f(x) = \frac{x}{1 + \left| \frac{x}{B} \right|}
-
     Arguments:
         bound: The codomain bound :math:`B`.
     """
@@ -262,40 +298,6 @@ class InverseSoftclipTransform(Transform):
 
     def log_abs_det_jacobian(self, x: Tensor, y: Tensor) -> Tensor:
         return -2 * torch.log1p(abs(x / self.bound))
-
-
-class InverseTanhTransform(Transform):
-    r"""Creates a transform that maps :math:`[-1,1]` to the inverval :math:`R`.
-
-    .. math:: f(x) = arctanh(x)
-
-    Derivative:
-
-    .. math:: f'(x) = \frac{1}{1 - x^2}
-
-    """
-
-    domain =  constraints.interval(-1, 1)
-    codomain = constraints.real
-    bijective = True
-    sign = +1
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def __repr__(self) -> str:
-        return f'{self.__class__.__name__}()'
-
-    def _call(self, x: Tensor) -> Tensor:
-        return x.atanh()
-
-    def _inverse(self, y: Tensor) -> Tensor:
-        return y.tanh()
-
-    def log_abs_det_jacobian(self, x: Tensor, y: Tensor) -> Tensor:
-        return 1 / (1 - x**2)
-
-
 
 class MonotonicAffineTransform(Transform):
     r"""Creates a transformation :math:`f(x) = \alpha x + \beta`.
@@ -607,16 +609,13 @@ class SOSPolynomialTransform(UnconstrainedMonotonicTransform):
         return p.squeeze(dim=-1).square().sum(dim=-1)
 
 
-class FFJTransform(Transform):
-    r"""Creates a free-form Jacobian (FFJ) transformation.
+class FreeFormJacobianTransform(Transform):
+    r"""Creates a free-form Jacobian transformation.
 
     The transformation is the integration of a system of first-order ordinary
     differential equations
 
-    .. math:: x(T) = \int_0^T f_\phi(x(t), t) ~ dt .
-
-    The log-determinant of the Jacobian is replaced by an unbiased stochastic
-    linear-time estimate.
+    .. math:: x(T) = \int_0^T f_\phi(t, x(t)) ~ dt .
 
     References:
         | FFJORD: Free-form Continuous Dynamics for Scalable Reversible Generative Models (Grathwohl et al., 2018)
@@ -626,6 +625,8 @@ class FFJTransform(Transform):
         f: A system of first-order ODEs :math:`f_\phi`.
         time: The integration time :math:`T`.
         phi: The parameters :math:`\phi` of :math:`f_\phi`.
+        exact: Whether the exact log-determinant of the Jacobian or an unbiased
+            stochastic estimate thereof is calculated.
     """
 
     domain = constraints.real_vector
@@ -637,6 +638,7 @@ class FFJTransform(Transform):
         f: Callable[[Tensor, Tensor], Tensor],
         time: Tensor,
         phi: Iterable[Tensor] = (),
+        exact: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -645,6 +647,8 @@ class FFJTransform(Transform):
         self.t0 = time.new_tensor(0.0)
         self.t1 = time
         self.phi = tuple(filter(lambda p: p.requires_grad, phi))
+        self.exact = exact
+        self.trace_scale = 1e-2  # relax jacobian tolerances
 
     def _call(self, x: Tensor) -> Tensor:
         return odeint(self.f, x, self.t0, self.t1, self.phi)
@@ -657,31 +661,36 @@ class FFJTransform(Transform):
         return ladj
 
     def call_and_ladj(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        shape = x.shape
-        size = x.numel()
+        if self.exact:
+            I = torch.eye(x.shape[-1], dtype=x.dtype, device=x.device)
+            I = I.expand(*x.shape, x.shape[-1]).movedim(-1, 0)
 
-        eps = torch.randn_like(x)
+            def f_aug(t: Tensor, x: Tensor, ladj: Tensor) -> Tensor:
+                with torch.enable_grad():
+                    x = x.requires_grad_().expand(I.shape)
+                    dx = self.f(t, x)
 
-        def f_aug(x_aug: Tensor, t: Tensor) -> Tensor:
-            x = x_aug[:size].reshape(shape)
+                jacobian = torch.autograd.grad(dx, x, I, create_graph=True)[0]
+                trace = torch.einsum('i...i', jacobian)
 
-            with torch.enable_grad():
-                x = x.requires_grad_()
-                dx = self.f(x, t)
+                return dx[0], trace * self.trace_scale
+        else:
+            eps = torch.randn_like(x)
 
-            epsjp = torch.autograd.grad(dx, x, eps, create_graph=True)[0]
-            trace = (epsjp * eps).sum(dim=-1)
+            def f_aug(t: Tensor, x: Tensor, ladj: Tensor) -> Tensor:
+                with torch.enable_grad():
+                    x = x.requires_grad_()
+                    dx = self.f(t, x)
 
-            return torch.cat((dx.flatten(), trace.flatten()))
+                epsjp = torch.autograd.grad(dx, x, eps, create_graph=True)[0]
+                trace = (epsjp * eps).sum(dim=-1)
 
-        zeros = x.new_zeros(shape[:-1])
+                return dx, trace * self.trace_scale
 
-        x_aug = torch.cat((x.flatten(), zeros.flatten()))
-        y_aug = odeint(f_aug, x_aug, self.t0, self.t1, self.phi)
+        ladj = torch.zeros_like(x[..., 0])
+        y, ladj = odeint(f_aug, (x, ladj), self.t0, self.t1, self.phi)
 
-        y, score = y_aug[:size], y_aug[size:]
-
-        return y.reshape(shape), score.reshape(shape[:-1])
+        return y, ladj * (1 / self.trace_scale)
 
 
 class AutoregressiveTransform(Transform):

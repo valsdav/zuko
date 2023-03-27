@@ -14,6 +14,7 @@ def test_univariate_transforms():
         CosTransform(),
         SinTransform(),
         SoftclipTransform(),
+        CircularShiftTransform(),
         MonotonicAffineTransform(randn(256), randn(256)),
         MonotonicRQSTransform(randn(256, 8), randn(256, 8), randn(256, 7)),
         MonotonicTransform(lambda x: x**3),
@@ -26,7 +27,7 @@ def test_univariate_transforms():
         if hasattr(t.domain, 'lower_bound'):
             x = torch.linspace(t.domain.lower_bound + 1e-2, t.domain.upper_bound - 1e-2, 256)
         else:
-            x = torch.linspace(-5.0, 5.0, 256)
+            x = torch.linspace(-4.999, 4.999, 256)
 
         y = t(x)
 
@@ -47,6 +48,12 @@ def test_univariate_transforms():
 
         assert torch.allclose(t.log_abs_det_jacobian(x, y), ladj, atol=1e-4), t
 
+        # Compound call
+        y_comp, ladj_comp = t.call_and_ladj(x)
+
+        assert torch.allclose(y_comp, y, atol=1e-4), t
+        assert torch.allclose(ladj_comp, ladj, atol=1e-4), t
+
         # Inverse Jacobian
         J = torch.autograd.functional.jacobian(t.inv, y)
 
@@ -58,13 +65,13 @@ def test_univariate_transforms():
         assert torch.allclose(t.inv.log_abs_det_jacobian(y, z), ladj, atol=1e-4), t
 
 
-def test_FFJTransform():
-    a = torch.randn(3)
-    f = lambda x, t: a * x
-    t = FFJTransform(f, time=torch.tensor(1.0))
+def test_FreeFormJacobianTransform():
+    A, B = torch.randn(5, 16), torch.randn(16, 5)
+    f = lambda t, x: torch.sigmoid(x @ A) @ B
+    t = FreeFormJacobianTransform(f, time=torch.tensor(1.0))
 
     # Call
-    x = randn(256, 3)
+    x = randn(256, 5)
     y = t(x)
 
     assert x.shape == y.shape
@@ -75,9 +82,19 @@ def test_FFJTransform():
     assert torch.allclose(x, z, atol=1e-4)
 
     # Jacobian
-    ladj = t.log_abs_det_jacobian(x, y)
+    x = randn(5)
+    y = t(x)
 
-    assert ladj.shape == x.shape[:-1]
+    J = torch.autograd.functional.jacobian(t, x)
+    ladj = torch.linalg.slogdet(J).logabsdet
+
+    assert torch.allclose(t.log_abs_det_jacobian(x, y), ladj, atol=1e-4), t
+
+    # Compound call
+    y_comp, ladj_comp = t.call_and_ladj(x)
+
+    assert torch.allclose(y_comp, y, atol=1e-4), t
+    assert torch.allclose(ladj_comp, ladj, atol=1e-4), t
 
 
 def test_PermutationTransform():

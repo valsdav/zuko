@@ -4,14 +4,17 @@ __all__ = [
     'DistributionModule',
     'TransformModule',
     'FlowModule',
+    'GMM',
     'MaskedAutoregressiveTransform',
     'MAF',
     'NSF',
+    'NCSF',
     'SOSPF',
     'NeuralAutoregressiveTransform',
-    'UnconstrainedNeuralAutoregressiveTransform',
     'NAF',
-    'FreeFormJacobianTransform',
+    'UnconstrainedNeuralAutoregressiveTransform',
+    'UNAF',
+    'FFJTransform',
     'CNF',
     'SimpleAffineTransform',
     'IntervalToRealTransform'
@@ -22,7 +25,8 @@ import torch
 import torch.nn as nn
 
 from functools import partial
-from math import ceil
+from math import ceil, pi
+from textwrap import indent
 from torch import Tensor, LongTensor, Size
 from torch.distributions import *
 from typing import *
@@ -75,7 +79,7 @@ class FlowModule(DistributionModule):
 
     def __init__(
         self,
-        transforms: List[TransformModule],
+        transforms: Sequence[TransformModule],
         base: DistributionModule,
     ):
         super().__init__()
@@ -143,6 +147,71 @@ class Unconditional(nn.Module):
         )
 
 
+class Parameters(nn.ParameterList):
+    r"""Creates a list of parameters."""
+
+    def extra_repr(self) -> str:
+        lines = [
+            f'({i}): tensor of shape {tuple(p.shape)}'
+            for i, p in enumerate(self)
+        ]
+
+        return indent('\n'.join(lines), '  ')
+
+
+class GMM(DistributionModule):
+    r"""Creates a Gaussian mixture model (GMM).
+
+    .. math:: p(X | y) = \sum_{i = 1}^K w_i(y) \, \mathcal{N}(X | \mu_i(y), \Sigma_i(y))
+
+    Arguments:
+        features: The number of features.
+        context: The number of context features.
+        components: The number of components :math:`K` in the mixture.
+        **kwargs: Keyword arguments passed to :class:`zuko.nn.MLP`.
+    """
+
+    def __init__(
+        self,
+        features: int,
+        context: int = 0,
+        components: int = 2,
+        **kwargs,
+    ):
+        super().__init__()
+
+        shapes = [
+            (components,),  # probabilities
+            (components, features),  # mean
+            (components, features),  # diagonal
+            (components, features * (features - 1) // 2),  # off diagonal
+        ]
+
+        self.shapes = list(map(Size, shapes))
+        self.sizes = [s.numel() for s in self.shapes]
+
+        if context > 0:
+            self.hyper = MLP(context, sum(self.sizes), **kwargs)
+        else:
+            self.phi = Parameters(torch.randn(*s) for s in shapes)
+
+    def forward(self, y: Tensor = None) -> Distribution:
+        if y is None:
+            phi = self.phi
+        else:
+            phi = self.hyper(y)
+            phi = phi.split(self.sizes, -1)
+            phi = (p.unflatten(-1, s) for p, s in zip(phi, self.shapes))
+
+        logits, loc, diag, tril = phi
+
+        scale = torch.diag_embed(diag.exp() + 1e-5)
+        mask = torch.tril(torch.ones_like(scale, dtype=bool), diagonal=-1)
+        scale = torch.masked_scatter(scale, mask, tril)
+
+        return Mixture(MultivariateNormal(loc=loc, scale_tril=scale), logits)
+
+
 class MaskedAutoregressiveTransform(TransformModule):
     r"""Creates a masked autoregressive transformation.
 
@@ -192,7 +261,7 @@ class MaskedAutoregressiveTransform(TransformModule):
         order: LongTensor = None,
         univariate: Callable[..., Transform] = MonotonicAffineTransform,
         univariate_kwargs: Dict[str, Any] = {},
-        shapes: List[Size] = [(), ()],
+        shapes: Sequence[Size] = ((), ()),
         **kwargs,
     ):
         super().__init__()
@@ -259,7 +328,7 @@ class MAF(FlowModule):
 
     References:
         | Masked Autoregressive Flow for Density Estimation (Papamakarios et al., 2017)
- >        | https://arxiv.org/abs/1705.07057
+        | https://arxiv.org/abs/1705.07057
 
     Arguments:
         features: The number of features.
@@ -394,6 +463,48 @@ class NSF(MAF):
         )
 
 
+class NCSF(NSF):
+    r"""Creates a neural circular spline flow (NCSF).
+
+    Note:
+        Features are assumed to lie in the half-open interval :math:`[-\pi, \pi[`.
+
+    References:
+        | Normalizing Flows on Tori and Spheres (Rezende et al., 2020)
+        | https://arxiv.org/abs/2002.02428
+
+    Arguments:
+        features: The number of features.
+        context: The number of context features.
+        kwargs: Keyword arguments passed to :class:`NSF`.
+    """
+
+    def __init__(
+        self,
+        features: int,
+        context: int = 0,
+        **kwargs,
+    ):
+        super().__init__(features, context, **kwargs)
+
+        for t in self.transforms:
+            t.univariate = self.circular_spline
+
+        self.base = Unconditional(
+            BoxUniform,
+            torch.full((features,), -pi - 1e-5),
+            torch.full((features,), pi + 1e-5),
+            buffer=True,
+        )
+
+    @staticmethod
+    def circular_spline(*args) -> Transform:
+        return ComposedTransform(
+            CircularShiftTransform(bound=pi),
+            MonotonicRQSTransform(*args, bound=pi),
+        )
+
+
 class SOSPF(MAF):
     r"""Creates a sum-of-squares polynomial flow (SOSPF).
 
@@ -508,6 +619,60 @@ class NeuralAutoregressiveTransform(MaskedAutoregressiveTransform):
         )
 
 
+class NAF(FlowModule):
+    r"""Creates a neural autoregressive flow (NAF).
+
+    References:
+        | Neural Autoregressive Flows (Huang et al., 2018)
+        | https://arxiv.org/abs/1804.00779
+
+    Arguments:
+        features: The number of features.
+        context: The number of context features.
+        transforms: The number of autoregressive transformations.
+        randperm: Whether features are randomly permuted between transformations or not.
+            If :py:`False`, features are in ascending (descending) order for even
+            (odd) transformations.
+        unconstrained: Whether to use unconstrained or regular monotonic networks.
+        kwargs: Keyword arguments passed to :class:`NeuralAutoregressiveTransform`.
+    """
+
+    def __init__(
+        self,
+        features: int,
+        context: int = 0,
+        transforms: int = 3,
+        randperm: bool = False,
+        **kwargs,
+    ):
+        orders = [
+            torch.arange(features),
+            torch.flipud(torch.arange(features)),
+        ]
+
+        transforms = [
+            NeuralAutoregressiveTransform(
+                features=features,
+                context=context,
+                order=torch.randperm(features) if randperm else orders[i % 2],
+                **kwargs,
+            )
+            for i in range(transforms)
+        ]
+
+        for i in reversed(range(len(transforms))):
+            transforms.insert(i, Unconditional(SoftclipTransform))
+
+        base = Unconditional(
+            DiagNormal,
+            torch.zeros(features),
+            torch.ones(features),
+            buffer=True,
+        )
+
+        super().__init__(transforms, base)
+
+
 class UnconstrainedNeuralAutoregressiveTransform(MaskedAutoregressiveTransform):
     r"""Creates an unconstrained neural autoregressive transformation.
 
@@ -592,13 +757,10 @@ class UnconstrainedNeuralAutoregressiveTransform(MaskedAutoregressiveTransform):
         )
 
 
-class NAF(FlowModule):
-    r"""Creates a neural autoregressive flow (NAF).
+class UNAF(FlowModule):
+    r"""Creates an unconstrained neural autoregressive flow (UNAF).
 
     References:
-        | Neural Autoregressive Flows (Huang et al., 2018)
-        | https://arxiv.org/abs/1804.00779
-
         | Unconstrained Monotonic Neural Networks (Wehenkel et al., 2019)
         | https://arxiv.org/abs/1908.05164
 
@@ -609,9 +771,7 @@ class NAF(FlowModule):
         randperm: Whether features are randomly permuted between transformations or not.
             If :py:`False`, features are in ascending (descending) order for even
             (odd) transformations.
-        unconstrained: Whether to use unconstrained or regular monotonic networks.
-        kwargs: Keyword arguments passed to :class:`NeuralAutoregressiveTransform` or
-            :class:`UnconstrainedNeuralAutoregressiveTransform`.
+        kwargs: Keyword arguments passed to :class:`UnconstrainedNeuralAutoregressiveTransform`.
     """
 
     def __init__(
@@ -620,21 +780,15 @@ class NAF(FlowModule):
         context: int = 0,
         transforms: int = 3,
         randperm: bool = False,
-        unconstrained: bool = False,
         **kwargs,
     ):
-        if unconstrained:
-            build = UnconstrainedNeuralAutoregressiveTransform
-        else:
-            build = NeuralAutoregressiveTransform
-
         orders = [
             torch.arange(features),
             torch.flipud(torch.arange(features)),
         ]
 
         transforms = [
-            build(
+            UnconstrainedNeuralAutoregressiveTransform(
                 features=features,
                 context=context,
                 order=torch.randperm(features) if randperm else orders[i % 2],
@@ -656,8 +810,8 @@ class NAF(FlowModule):
         super().__init__(transforms, base)
 
 
-class FreeFormJacobianTransform(TransformModule):
-    r"""Creates a free-form Jacobian transformation.
+class FFJTransform(TransformModule):
+    r"""Creates a free-form Jacobian (FFJ) transformation.
 
     References:
         | FFJORD: Free-form Continuous Dynamics for Scalable Reversible Generative Models (Grathwohl et al., 2018)
@@ -666,15 +820,17 @@ class FreeFormJacobianTransform(TransformModule):
     Arguments:
         features: The number of features.
         context: The number of context features.
+        frequencies: The number of time embedding frequencies.
+        exact: Whether the exact log-determinant of the Jacobian or an unbiased
+            stochastic estimate thereof is calculated.
         kwargs: Keyword arguments passed to :class:`zuko.nn.MLP`.
 
     Example:
-        >>> t = FreeFormJacobianTranform(3, 4)
+        >>> t = FFJTransform(3, 4)
         >>> t
-        FreeFormJacobianTranform(
-          (time): 1.000
+        FFJTransform(
           (ode): MLP(
-            (0): Linear(in_features=8, out_features=64, bias=True)
+            (0): Linear(in_features=13, out_features=64, bias=True)
             (1): ELU(alpha=1.0)
             (2): Linear(in_features=64, out_features=64, bias=True)
             (3): ELU(alpha=1.0)
@@ -694,31 +850,38 @@ class FreeFormJacobianTransform(TransformModule):
         self,
         features: int,
         context: int = 0,
+        frequencies: int = 3,
+        exact: bool = True,
         **kwargs,
     ):
         super().__init__()
 
         kwargs.setdefault('activation', nn.ELU)
 
-        self.ode = MLP(features + 1 + context, features, **kwargs)
-        self.log_t = nn.Parameter(torch.tensor(0.0))
+        self.ode = MLP(features + context + 2 * frequencies, features, **kwargs)
 
-    def extra_repr(self) -> str:
-        return f'(time): {self.log_t.exp().item():.3f}'
+        self.register_buffer('time', torch.tensor(1.0))
+        self.register_buffer('frequencies', 2 ** torch.arange(frequencies) * pi)
 
-    def f(self, y: Tensor, x: Tensor, t: Tensor) -> Tensor:
+        self.exact = exact
+
+    def f(self, t: Tensor, x: Tensor, y: Tensor = None) -> Tensor:
+        t = self.frequencies * t[..., None]
+        t = torch.cat((t.cos(), t.sin()), dim=-1)
+
         if y is None:
-            x = torch.cat(broadcast(x, t[..., None], ignore=1), dim=-1)
+            x = torch.cat(broadcast(t, x, ignore=1), dim=-1)
         else:
-            x = torch.cat(broadcast(x, t[..., None], y, ignore=1), dim=-1)
+            x = torch.cat(broadcast(t, x, y, ignore=1), dim=-1)
 
         return self.ode(x)
 
     def forward(self, y: Tensor = None) -> Transform:
-        return FFJTransform(
-            f=partial(self.f, y),
-            time=self.log_t.exp(),
-            phi=(y, *self.ode.parameters()),
+        return FreeFormJacobianTransform(
+            f=partial(self.f, y=y),
+            time=self.time,
+            phi=self.ode.parameters() if y is None else (y, *self.ode.parameters()),
+            exact=self.exact,
         )
 
 
@@ -737,7 +900,7 @@ class CNF(FlowModule):
         features: The number of features.
         context: The number of context features.
         transforms: The number of transformations.
-        kwargs: Keyword arguments passed to :class:`FreeFormJacobianTransform`.
+        kwargs: Keyword arguments passed to :class:`FFJTransform`.
     """
 
     def __init__(
@@ -748,7 +911,7 @@ class CNF(FlowModule):
         **kwargs,
     ):
         transforms = [
-            FreeFormJacobianTransform(
+            FFJTransform(
                 features=features,
                 context=context,
                 **kwargs,
