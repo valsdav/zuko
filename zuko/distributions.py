@@ -120,6 +120,17 @@ class NormalizingFlow(Distribution):
 
         return self.transform.inv(z)
 
+    def rsample_and_log_prob(self, shape: Size = ()) -> Tuple[Tensor, Tensor]:
+        if self.base.has_rsample:
+            z = self.base.rsample(shape)
+        else:
+            z = self.base.sample(shape)
+
+        x, ladj = self.transform.inv.call_and_ladj(z)
+        ladj = _sum_rightmost(ladj, self.reinterpreted)
+
+        return x, self.base.log_prob(z) - ladj
+
 
 class Joint(Distribution):
     r"""Creates a distribution for a multivariate random variable :math:`X` which
@@ -340,7 +351,7 @@ class DiagNormal(Independent):
     """
 
     def __init__(self, loc: Tensor, scale: Tensor, ndims: int = 1):
-        super().__init__(Normal(loc, scale), ndims)
+        super().__init__(Normal(torch.as_tensor(loc), torch.as_tensor(scale)), ndims)
 
     def __repr__(self) -> str:
         return 'Diag' + repr(self.base_dist)
@@ -373,7 +384,7 @@ class BoxUniform(Independent):
     """
 
     def __init__(self, lower: Tensor, upper: Tensor, ndims: int = 1):
-        super().__init__(Uniform(lower, upper), ndims)
+        super().__init__(Uniform(torch.as_tensor(lower), torch.as_tensor(upper)), ndims)
 
     def __repr__(self) -> str:
         return 'Box' + repr(self.base_dist)

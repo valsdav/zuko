@@ -14,6 +14,7 @@ __all__ = [
     'SOSPolynomialTransform',
     'FreeFormJacobianTransform',
     'AutoregressiveTransform',
+    'LULinearTransform',
     'PermutationTransform',
     'InverseSoftclipTransform',
 ]
@@ -107,6 +108,17 @@ class ComposedTransform(Transform):
         for t in self.transforms:
             x = t(x)
         return x
+
+    @property
+    def inv(self) -> Transform:
+        new = self.__new__(ComposedTransform)
+        new.transforms = [t.inv for t in reversed(self.transforms)]
+        new.domain_dim = self.codomain_dim
+        new.codomain_dim = self.domain_dim
+
+        Transform.__init__(new)
+
+        return new
 
     def _inverse(self, y: Tensor) -> Tensor:
         for t in reversed(self.transforms):
@@ -615,7 +627,7 @@ class FreeFormJacobianTransform(Transform):
     The transformation is the integration of a system of first-order ordinary
     differential equations
 
-    .. math:: x(T) = \int_0^T f_\phi(t, x(t)) ~ dt .
+    .. math:: x(t_1) = x_0 + \int_{t_0}^{t_1} f_\phi(t, x(t)) ~ dt .
 
     References:
         | FFJORD: Free-form Continuous Dynamics for Scalable Reversible Generative Models (Grathwohl et al., 2018)
@@ -623,7 +635,8 @@ class FreeFormJacobianTransform(Transform):
 
     Arguments:
         f: A system of first-order ODEs :math:`f_\phi`.
-        time: The integration time :math:`T`.
+        t0: The initial integration time :math:`t_0`.
+        t1: The final integration time :math:`t_1`.
         phi: The parameters :math:`\phi` of :math:`f_\phi`.
         exact: Whether the exact log-determinant of the Jacobian or an unbiased
             stochastic estimate thereof is calculated.
@@ -636,7 +649,8 @@ class FreeFormJacobianTransform(Transform):
     def __init__(
         self,
         f: Callable[[Tensor, Tensor], Tensor],
-        time: Tensor,
+        t0: Union[float, Tensor] = 0.0,
+        t1: Union[float, Tensor] = 1.0,
         phi: Iterable[Tensor] = (),
         exact: bool = True,
         **kwargs,
@@ -644,14 +658,24 @@ class FreeFormJacobianTransform(Transform):
         super().__init__(**kwargs)
 
         self.f = f
-        self.t0 = time.new_tensor(0.0)
-        self.t1 = time
+        self.t0 = t0
+        self.t1 = t1
         self.phi = tuple(filter(lambda p: p.requires_grad, phi))
         self.exact = exact
         self.trace_scale = 1e-2  # relax jacobian tolerances
 
     def _call(self, x: Tensor) -> Tensor:
         return odeint(self.f, x, self.t0, self.t1, self.phi)
+
+    @property
+    def inv(self) -> Transform:
+        return FreeFormJacobianTransform(
+            f=self.f,
+            t0=self.t1,
+            t1=self.t0,
+            phi=self.phi,
+            exact=self.exact,
+        )
 
     def _inverse(self, y: Tensor) -> Tensor:
         return odeint(self.f, y, self.t1, self.t0, self.phi)
@@ -664,28 +688,22 @@ class FreeFormJacobianTransform(Transform):
         if self.exact:
             I = torch.eye(x.shape[-1], dtype=x.dtype, device=x.device)
             I = I.expand(*x.shape, x.shape[-1]).movedim(-1, 0)
-
-            def f_aug(t: Tensor, x: Tensor, ladj: Tensor) -> Tensor:
-                with torch.enable_grad():
-                    x = x.requires_grad_().expand(I.shape)
-                    dx = self.f(t, x)
-
-                jacobian = torch.autograd.grad(dx, x, I, create_graph=True)[0]
-                trace = torch.einsum('i...i', jacobian)
-
-                return dx[0], trace * self.trace_scale
         else:
             eps = torch.randn_like(x)
 
-            def f_aug(t: Tensor, x: Tensor, ladj: Tensor) -> Tensor:
-                with torch.enable_grad():
-                    x = x.requires_grad_()
-                    dx = self.f(t, x)
+        def f_aug(t: Tensor, x: Tensor, ladj: Tensor) -> Tensor:
+            with torch.enable_grad():
+                x = x.requires_grad_()
+                dx = self.f(t, x)
 
+            if self.exact:
+                jacobian = torch.autograd.grad(dx, x, I, create_graph=True, is_grads_batched=True)[0]
+                trace = torch.einsum('i...i', jacobian)
+            else:
                 epsjp = torch.autograd.grad(dx, x, eps, create_graph=True)[0]
                 trace = (epsjp * eps).sum(dim=-1)
 
-                return dx, trace * self.trace_scale
+            return dx, trace * self.trace_scale
 
         ladj = torch.zeros_like(x[..., 0])
         y, ladj = odeint(f_aug, (x, ladj), self.t0, self.t1, self.phi)
@@ -734,6 +752,46 @@ class AutoregressiveTransform(Transform):
     def call_and_ladj(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         y, ladj = self.meta(x).call_and_ladj(x)
         return y, ladj.sum(dim=-1)
+
+
+class LULinearTransform(Transform):
+    r"""Creates a transformation :math:`f(x) = L U x`.
+
+    Arguments:
+        LU: A matrix whose lower and upper triangular parts are the non-zero elements
+            of :math:`L` and :math:`U`, with shape :math:`(*, D, D)`.
+    """
+
+    domain = constraints.real_vector
+    codomain = constraints.real_vector
+    bijective = True
+
+    def __init__(self, LU: Tensor, **kwargs):
+        super().__init__(**kwargs)
+
+        I = torch.eye(LU.shape[-1], dtype=LU.dtype, device=LU.device)
+
+        self.L = torch.tril(LU, diagonal=-1) + I
+        self.U = torch.triu(LU, diagonal=+1) + I
+
+    def _call(self, x: Tensor) -> Tensor:
+        return (self.L @ self.U @ x.unsqueeze(-1)).squeeze(-1)
+
+    def _inverse(self, y: Tensor) -> Tensor:
+        return torch.linalg.solve_triangular(
+            self.U,
+            torch.linalg.solve_triangular(
+                self.L,
+                y.unsqueeze(-1),
+                upper=False,
+                unitriangular=True,
+            ),
+            upper=True,
+            unitriangular=True,
+        ).squeeze(-1)
+
+    def log_abs_det_jacobian(self, x: Tensor, y: Tensor) -> Tensor:
+        return x.new_zeros(x.shape[:-1])
 
 
 class PermutationTransform(Transform):
