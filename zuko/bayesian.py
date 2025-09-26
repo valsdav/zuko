@@ -266,7 +266,10 @@ class BayesianModel(nn.Module):
             var_out = var_out + torch.exp(b_logvar)
 
         # Sample output using reparameterization trick
-        result = torch.normal(mu_out, var_out.sqrt(), generator=generator)
+        # result = torch.normal(mu_out, var_out.sqrt(), generator=generator)
+        result = mu_out + var_out.sqrt() * torch.randn(
+            mu_out.shape, device=mu_out.device, generator=generator
+        )
         return result
 
     def kl_divergence(self, prior_std: float = 1.0):
